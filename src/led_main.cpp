@@ -179,12 +179,13 @@ void processCommand(String cmd) {
     if (score >= 1 && score <= 7) {
       // Map score 1-7 to strip index 0-6
       receivedScore = score - 1;
+      scoreReady = true;
     } else {
-      // Score 0 (unknown) — pick random strip
-      receivedScore = random(NUM_STRIPS);
-      Serial.printf("[CMD] Score 0/unknown — random strip %d\n", receivedScore);
+      // Score 0 — not a crystal or person, abort animation
+      Serial.println("[CMD] Score 0 — not a crystal/person, returning to IDLE");
+      Serial1.println("DONE");
+      enterState(IDLE);
     }
-    scoreReady = true;
   }
 }
 

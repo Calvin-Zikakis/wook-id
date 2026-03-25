@@ -106,16 +106,23 @@ bool ledControllerPresent = false;
 #define LED_DONE_TIMEOUT_MS 60000  // 60s safety timeout
 
 bool checkLedController() {
-    // Flush any stale data
-    while (Serial2.available()) Serial2.read();
-    Serial2.println("PING");
-    unsigned long start = millis();
-    while (millis() - start < 100) {
-        if (Serial2.available()) {
-            String msg = Serial2.readStringUntil('\n');
-            msg.trim();
-            if (msg == "PONG") return true;
+    for (int attempt = 0; attempt < 3; attempt++) {
+        while (Serial2.available()) Serial2.read();  // flush stale data
+        Serial2.println("PING");
+        Log.printf("PING attempt %d...\n", attempt + 1);
+        unsigned long start = millis();
+        while (millis() - start < 500) {  // 500ms timeout per attempt
+            if (Serial2.available()) {
+                String msg = Serial2.readStringUntil('\n');
+                msg.trim();
+                if (msg == "PONG") {
+                    Log.println("PONG received!");
+                    return true;
+                }
+                Log.printf("Got unexpected response: '%s'\n", msg.c_str());
+            }
         }
+        Log.println("No PONG - retrying...");
     }
     return false;
 }
@@ -172,6 +179,74 @@ void initCamera() {
         return;
     }
     Log.println("Camera initialized");
+}
+
+// ---------------------------------------------------------------------------
+// Upload result + photo to logging server
+// ---------------------------------------------------------------------------
+void uploadResult(int score, const String &description) {
+    if (!lastPhoto || lastPhotoLen == 0) {
+        Log.println("No photo to upload");
+        return;
+    }
+
+    WiFiClientSecure client;
+    client.setInsecure();  // skip cert verification (same as Claude API calls)
+    if (!client.connect(LOG_SERVER_HOST, LOG_SERVER_PORT)) {
+        Log.println("Upload: failed to connect to log server");
+        return;
+    }
+
+    String boundary = "----WookBoundary";
+
+    // Build the multipart fields (score + description)
+    String fields;
+    fields += "--" + boundary + "\r\n";
+    fields += "Content-Disposition: form-data; name=\"wokeScore\"\r\n\r\n";
+    fields += String(score) + "\r\n";
+    fields += "--" + boundary + "\r\n";
+    fields += "Content-Disposition: form-data; name=\"description\"\r\n\r\n";
+    fields += description + "\r\n";
+
+    // Photo part header + footer
+    String photoHeader = "--" + boundary + "\r\n";
+    photoHeader += "Content-Disposition: form-data; name=\"photo\"; filename=\"crystal.jpg\"\r\n";
+    photoHeader += "Content-Type: image/jpeg\r\n\r\n";
+    String footer = "\r\n--" + boundary + "--\r\n";
+
+    int contentLength = fields.length() + photoHeader.length() + lastPhotoLen + footer.length();
+
+    client.printf("POST /api/upload HTTP/1.1\r\n");
+    client.printf("Host: %s\r\n", LOG_SERVER_HOST);
+    client.printf("X-API-Key: %s\r\n", LOG_API_KEY);
+    client.printf("Content-Type: multipart/form-data; boundary=%s\r\n", boundary.c_str());
+    client.printf("Content-Length: %d\r\n", contentLength);
+    client.println("Connection: close\r\n");
+
+    client.print(fields);
+    client.print(photoHeader);
+
+    // Send photo in chunks to avoid memory issues
+    const size_t chunkSize = 2048;
+    for (size_t i = 0; i < lastPhotoLen; i += chunkSize) {
+        size_t len = min(chunkSize, lastPhotoLen - i);
+        client.write(lastPhoto + i, len);
+    }
+
+    client.print(footer);
+
+    // Read response
+    unsigned long start = millis();
+    while (client.connected() && millis() - start < 5000) {
+        if (client.available()) {
+            String line = client.readStringUntil('\n');
+            Log.println("Upload response: " + line);
+            break;
+        }
+        delay(10);
+    }
+    client.stop();
+    Log.println("Upload complete");
 }
 
 String callClaude(camera_fb_t *fb) {
@@ -346,7 +421,6 @@ void handleRoot() {
         .cam-frame::after { content: ''; position: absolute; top: 0; left: 0; right: 0; bottom: 0;
             border-radius: 12px; pointer-events: none;
             background: linear-gradient(135deg, rgba(139,69,255,0.05), transparent, rgba(255,107,53,0.05)); }
-        #stream { display: none; }
         .cam-loading { position: absolute; top: 0; left: 0; right: 0; bottom: 0;
             background: rgba(10,10,15,0.85); display: none; align-items: center;
             justify-content: center; flex-direction: column; z-index: 2; }
@@ -368,8 +442,6 @@ void handleRoot() {
                            box-shadow: 0 0 25px rgba(139,69,255,0.4); transform: scale(1.05); }
         .btn-cap { background: rgba(78,205,196,0.15); border-color: rgba(78,205,196,0.4); }
         .btn-cap:hover { background: rgba(78,205,196,0.3); box-shadow: 0 0 20px rgba(78,205,196,0.3); }
-        .btn-stream { background: rgba(255,107,53,0.15); border-color: rgba(255,107,53,0.4); }
-        .btn-stream:hover { background: rgba(255,107,53,0.3); box-shadow: 0 0 20px rgba(255,107,53,0.3); }
 
         /* Spinner */
         #spinner { display: none; margin: 20px; }
@@ -451,7 +523,7 @@ void handleRoot() {
             <div class="left-col">
                 <div class="cam-frame">
                     <img id="photo" src="/capture" alt="Awaiting crystal...">
-                    <img id="stream" src="" alt="Stream">
+
                     <div class="cam-loading" id="cam-loading">
                         <div class="crystal-spin"></div>
                         <div class="spinner-text">capturing...</div>
@@ -460,7 +532,7 @@ void handleRoot() {
                 <div class="controls">
                     <button class="btn-cap" onclick="capture()">Capture</button>
                     <button class="btn-judge" onclick="judge()">Judge Crystal</button>
-                    <button class="btn-stream" onclick="toggleStream()">Stream</button>
+
                     <button class="btn-cap" id="led-btn" onclick="toggleLed()">LED On</button>
                 </div>
                 <div class="controls">
@@ -499,23 +571,9 @@ void handleRoot() {
         }
         function capture() {
             document.getElementById('photo').style.display = 'block';
-            document.getElementById('stream').style.display = 'none';
             document.getElementById('photo').src = '/capture?' + Date.now();
         }
-        function toggleStream() {
-            var s = document.getElementById('stream');
-            var p = document.getElementById('photo');
-            if (s.style.display === 'none') {
-                s.src = '/stream';
-                s.style.display = 'block';
-                p.style.display = 'none';
-            } else {
-                s.src = '';
-                s.style.display = 'none';
-                p.style.display = 'block';
-            }
-        }
-        var vibes = ['','DEEP WOOK','WOOK','WOOKISH','BALANCED','WOKE-ISH','WOKE','PEAK WOKE'];
+        var vibes = ['','LEVEL 3 WOOK','LEVEL 2 WOOK','LEVEL 1 WOOK','NORMIE','LEVEL 1 WOKE','LEVEL 2 WOKE','LEVEL 3 WOKE'];
         function addThumb(photoUrl, data) {
             var idx = history.length;
             history.push({photo: photoUrl, data: data});
@@ -531,7 +589,7 @@ void handleRoot() {
             label.className = 'thumb-score';
             if (data.error) { label.innerText = 'ERR'; }
             else if (data.score == 0) { label.innerText = '?'; }
-            else { label.innerText = vibes[data.score] + ' ' + data.score; }
+            else { label.innerText = vibes[data.score]; }
             div.appendChild(label);
             reel.insertBefore(div, reel.firstChild);
             reel.scrollLeft = 0;
@@ -540,7 +598,7 @@ void handleRoot() {
             var h = history[idx];
             document.getElementById('photo').src = h.photo;
             document.getElementById('photo').style.display = 'block';
-            document.getElementById('stream').style.display = 'none';
+
             displayScore(h.data);
         }
         function displayScore(data) {
@@ -556,7 +614,7 @@ void handleRoot() {
             if (data.score == 0) {
                 document.getElementById('score-text').innerText = data.subject === 'human' ? 'UNREADABLE HUMAN' : 'NOT A CRYSTAL';
             } else {
-                document.getElementById('score-text').innerText = vibes[data.score] + '  ' + data.score + '/7';
+                document.getElementById('score-text').innerText = vibes[data.score];
             }
             document.getElementById('description').innerText = data.description;
         }
@@ -574,7 +632,7 @@ void handleRoot() {
             };
             img.src = photoUrl;
             img.style.display = 'block';
-            document.getElementById('stream').style.display = 'none';
+
             displayScore(data);
         }
         function judge() {
@@ -794,6 +852,7 @@ void setup() {
         HTTPUpload& upload = server.upload();
         if (upload.status == UPLOAD_FILE_START) {
             Log.printf("OTA Update: %s\n", upload.filename.c_str());
+            esp_camera_deinit();  // free ~370KB of frame buffer RAM for OTA
             if (!Update.begin(UPDATE_SIZE_UNKNOWN)) Update.printError(Log);
         } else if (upload.status == UPLOAD_FILE_WRITE) {
             if (Update.write(upload.buf, upload.currentSize) != upload.currentSize)
@@ -818,7 +877,7 @@ void setup() {
     Log.println("Web server started");
 
     ArduinoOTA.setHostname("wook-or-woke-cam");
-    ArduinoOTA.onStart([]() { Log.println("OTA Start"); });
+    ArduinoOTA.onStart([]() { esp_camera_deinit(); Log.println("OTA Start"); });
     ArduinoOTA.onEnd([]() { Log.println("\nOTA End"); });
     ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
         Log.printf("OTA Progress: %u%%\r", (progress / (total / 100)));
@@ -886,14 +945,22 @@ void loop() {
                 if (ledControllerPresent) Serial2.println("SCORE:0");
                 waitingForLedDone = false;
             } else {
-                // Extract score and send to LED controller
+                // Extract score and description, send to LED controller + log server
                 int scoreIdx = lastButtonResult.indexOf("\"score\":");
+                int descIdx = lastButtonResult.indexOf("\"description\":\"");
+                String description = "";
+                if (descIdx >= 0) {
+                    int start = descIdx + 15;  // skip past "description":"
+                    int end = lastButtonResult.indexOf("\"", start);
+                    if (end > start) description = lastButtonResult.substring(start, end);
+                }
                 if (scoreIdx >= 0) {
                     int score = lastButtonResult.charAt(scoreIdx + 8) - '0';
                     if (ledControllerPresent) {
                         Serial2.printf("SCORE:%d\n", score);
                         Log.printf("Sent SCORE:%d to LED controller\n", score);
                     }
+                    uploadResult(score, description);
                 }
             }
         } else {
