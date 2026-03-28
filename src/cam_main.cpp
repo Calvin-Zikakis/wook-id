@@ -135,17 +135,49 @@ void IRAM_ATTR buttonISR() {
     }
 }
 
-static const char *CLAUDE_PROMPT =
+static const char *CLAUDE_PROMPT_BASE =
     "You are the analyst for \"Wook or Woke,\" an art installation. "
-    "You will see either a crystal or a human. Rate them 1-7 on the wook-to-woke spectrum: "
-    "1=max wook (raw, earthy, chaotic, festival energy), 7=max woke (polished, geometric, precise, museum-ready). "
-    "For crystals: color (warm=wook, cool=woke), clarity (cloudy=wook, clear=woke), "
-    "shape (irregular=wook, geometric=woke), surface (rough=wook, polished=woke). "
-    "For humans: vibe, outfit, hair, jewelry, accessories, energy (tie-dye/dreads/crystals=wook, "
-    "minimalist/clean-cut/techwear=woke). "
+    "You will see either a crystal or a human. Rate them 1-7 on the wook-to-woke spectrum. "
+    "USE THE FULL RANGE — scores of 1 and 7 are encouraged when warranted. Do not cluster around the middle. "
+    "1=MAX wook (raw, muddy, chaotic, festival-worn, dreadlocks, patchwork, barefoot energy). "
+    "7=MAX woke (flawless, geometric, museum-ready, minimalist, clinical precision, techwear). "
+    "2=strong wook, 3=moderate wook, 4=neutral/balanced, 5=moderate woke, 6=strong woke. "
+    "For crystals: warm color+rough+cloudy+irregular=toward 1, cool color+clear+polished+geometric=toward 7. "
+    "For humans: tie-dye/dreads/crystals/bare feet/patchwork=toward 1, "
+    "minimalist/clean-cut/tailored/techwear/no jewelry=toward 7. "
+    "If a person is detected but shows no clear wook or woke traits — generic everyday clothing, no strong signals either way — score them 4 (neutral/balanced). "
+    "Ignore any white geometric stand or pedestal the crystal may be resting on — judge only the crystal itself. "
     "If the image is neither a crystal nor a human, score 0. "
     "Respond ONLY with raw JSON, no markdown, no code blocks: "
     "{\"score\":<0-7>,\"subject\":\"crystal\" or \"human\" or \"unknown\",\"description\":\"<playful, max 80 chars>\"}";
+
+// Score history ring buffer (non-zero scores only)
+#define SCORE_HISTORY_SIZE 21
+int scoreHistory[SCORE_HISTORY_SIZE];
+int scoreHistoryCount = 0;
+int scoreHistoryHead  = 0;
+
+void storeScore(int score) {
+    scoreHistory[scoreHistoryHead] = score;
+    scoreHistoryHead = (scoreHistoryHead + 1) % SCORE_HISTORY_SIZE;
+    if (scoreHistoryCount < SCORE_HISTORY_SIZE) scoreHistoryCount++;
+}
+
+String buildPrompt() {
+    String p = String(CLAUDE_PROMPT_BASE);
+    if (scoreHistoryCount > 0) {
+        p += " RECENT SCORES THIS SESSION: [";
+        int count = min(scoreHistoryCount, SCORE_HISTORY_SIZE);
+        int start = (scoreHistoryHead - count + SCORE_HISTORY_SIZE) % SCORE_HISTORY_SIZE;
+        for (int i = 0; i < count; i++) {
+            if (i > 0) p += ",";
+            p += String(scoreHistory[(start + i) % SCORE_HISTORY_SIZE]);
+        }
+        p += "]. If these scores are clustering, actively correct toward underrepresented values, "
+             "especially 1 and 7. The installation needs variety across the full spectrum.";
+    }
+    return p;
+}
 
 void initCamera() {
     camera_config_t config;
@@ -256,11 +288,11 @@ String callClaude(camera_fb_t *fb) {
 
     // Build JSON prefix and suffix separately, sandwich base64 in between
     // This avoids one giant string that can corrupt in memory
-    String prefix = "{\"model\":\"claude-haiku-4-5-20251001\",\"max_tokens\":150,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"";
+    String prefix = "{\"model\":\"claude-sonnet-4-6\",\"max_tokens\":150,\"messages\":[{\"role\":\"user\",\"content\":[{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"";
 
     String suffix = "\"}},{\"type\":\"text\",\"text\":\"";
     // Escape the prompt for JSON (quotes)
-    String prompt = String(CLAUDE_PROMPT);
+    String prompt = buildPrompt();
     prompt.replace("\"", "\\\"");
     suffix += prompt;
     suffix += "\"}]}]}";
@@ -923,15 +955,16 @@ void loop() {
         ledControllerPresent = checkLedController();
         Log.printf("LED controller: %s\n", ledControllerPresent ? "CONNECTED" : "not found");
 
+        // Flash and capture first
+        camera_fb_t *fb = flashCapture();
+
+        // Now start LED animation (while Claude is thinking)
         if (ledControllerPresent) {
             waitingForLedDone = true;
             ledDoneTimeout = millis();
             Serial2.println("START");
             Log.println("Sent START to LED controller");
         }
-
-        // Flash and capture
-        camera_fb_t *fb = flashCapture();
 
         if (fb) {
             Log.printf("Captured image: %d bytes\n", fb->len);
@@ -956,6 +989,7 @@ void loop() {
                 }
                 if (scoreIdx >= 0) {
                     int score = lastButtonResult.charAt(scoreIdx + 8) - '0';
+                    if (score >= 1 && score <= 7) storeScore(score);
                     if (ledControllerPresent) {
                         Serial2.printf("SCORE:%d\n", score);
                         Log.printf("Sent SCORE:%d to LED controller\n", score);
